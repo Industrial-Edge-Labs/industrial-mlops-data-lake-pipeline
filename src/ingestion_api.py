@@ -1,75 +1,94 @@
-import io
-import uuid
-from datetime import datetime
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from minio import Minio
-from minio.error import S3Error
+from __future__ import annotations
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 import uvicorn
 
-app = FastAPI(title="Industrial Data Lake Ingestion API")
+from storage import ArtifactStore, UploadMetadata, load_runtime_config
 
-# Configure MinIO Object Store Connection
-# In production, these should be bound to secure Vault arguments
-MINIO_CLIENT = Minio(
-    "127.0.0.1:9000",
-    access_key="admin",
-    secret_key="IndustrialEdgeLabs2026",
-    secure=False
-)
 
-BUCKET_NAME = "edge-anomalies"
+app = FastAPI(title="Industrial MLOps Data Lake Ingestion API")
 
-def ensure_bucket_exists():
-    try:
-        found = MINIO_CLIENT.bucket_exists(BUCKET_NAME)
-        if not found:
-            MINIO_CLIENT.make_bucket(BUCKET_NAME)
-            print(f"[DataLake] Created Long-Term Storage Bucket: {BUCKET_NAME}")
-    except S3Error as e:
-        print(f"[DataLake] S3 API Target Unreachable: {e}")
+RUNTIME_CONFIG = load_runtime_config()
+STORE = ArtifactStore(RUNTIME_CONFIG)
+
 
 @app.on_event("startup")
-async def startup_event():
-    ensure_bucket_exists()
+async def startup_event() -> None:
+    STORE.ensure_ready()
+
+
+@app.get("/healthz")
+async def healthz() -> dict[str, object]:
+    stats = STORE.stats()
+    return {
+        "status": "ok",
+        "storage_mode": stats["storage_mode"],
+        "records_total": stats["records_total"],
+        "retraining_threshold": stats["retraining_threshold"],
+    }
+
+
+@app.get("/api/v1/datalake/stats")
+async def datalake_stats() -> dict[str, object]:
+    return STORE.stats()
+
 
 @app.post("/api/v1/datalake/upload")
 async def upload_anomaly(
     device_id: str = Form(...),
+    timestamp_ns: int = Form(...),
+    frame_id: int = Form(...),
     confidence: float = Form(...),
-    anomaly_image: UploadFile = File(...)
-):
-    """
-    Ingests binary defect crops from Edge Detection Modules (#4) alongside 
-    structured telemetry metadata asynchronously without blocking the edge runtime.
-    """
-    if not anomaly_image.content_type.startswith("image/"):
-        raise HTTPException(400, "Payload stream must be a valid imaging MIME boundary")
+    class_id: int = Form(...),
+    x: float = Form(...),
+    y: float = Form(...),
+    width: float = Form(...),
+    height: float = Form(...),
+    source_repo: str = Form("industrial-visual-inspection-engine"),
+    model_version: str = Form(""),
+    anomaly_image: UploadFile = File(...),
+) -> dict[str, object]:
+    content_type = anomaly_image.content_type or ""
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="anomaly_image must be an image payload")
 
     file_bytes = await anomaly_image.read()
-    file_stream = io.BytesIO(file_bytes)
-    
-    object_name = f"{device_id}/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4()}.jpg"
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="anomaly_image cannot be empty")
 
     try:
-        MINIO_CLIENT.put_object(
-            bucket_name=BUCKET_NAME,
-            object_name=object_name,
-            data=file_stream,
-            length=len(file_bytes),
-            content_type=anomaly_image.content_type,
-            metadata={
-                "Device-Id": device_id,
-                "Confidence-Score": str(confidence),
-                "Ingestion-Time": datetime.utcnow().isoformat()
-            }
+        record = STORE.append_upload(
+            UploadMetadata(
+                device_id=device_id,
+                timestamp_ns=timestamp_ns,
+                frame_id=frame_id,
+                confidence=confidence,
+                class_id=class_id,
+                x=x,
+                y=y,
+                width=width,
+                height=height,
+                source_repo=source_repo,
+                model_version=model_version,
+            ),
+            file_bytes=file_bytes,
+            filename=anomaly_image.filename or "anomaly.bin",
+            content_type=content_type,
         )
-        return {
-            "status": "success",
-            "message": "Anomaly snapshot safely persisted to Long-Term Storage",
-            "bucket_path": f"s3://{BUCKET_NAME}/{object_name}"
-        }
-    except S3Error as err:
-        raise HTTPException(500, detail=str(err))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return {
+        "status": "success",
+        "record_id": record.record_id,
+        "storage_mode": record.storage_mode,
+        "storage_uri": record.storage_uri,
+        "frame_id": record.frame_id,
+        "class_id": record.class_id,
+    }
+
 
 if __name__ == "__main__":
-    uvicorn.run("ingestion_api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("ingestion_api:app", host="127.0.0.1", port=8000, reload=False)
